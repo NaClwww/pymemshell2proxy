@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +43,7 @@ type HTTPTunnel struct {
 	Done      chan struct{}
 	closeOnce sync.Once
 
-	LocalAddr fakeAddr
+	LocalAddr net.TCPAddr
 }
 
 func isDebugEnabled() bool {
@@ -173,8 +175,23 @@ func (t *HTTPTunnel) AddConnect(streamId uint32, c *HTTPTunnelConnect) {
 }
 
 func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) (net.Conn, error) {
-	streamId := uint32(time.Now().UnixNano())
+	var streamId uint32
+	for {
+		streamId = uint32(time.Now().UnixNano())
+		if _, exists := t.GetConnect(streamId); !exists {
+			break
+		}
+	}
 	dlogf("[dial] request start: streamId=%d network=%s addr=%s", streamId, network, addr)
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid address: %w", err)
+	}
+	portNum, err := strconv.Atoi(port)
+	if err != nil {
+		return nil, fmt.Errorf("invalid port %q: %w", port, err)
+	}
+	var connect *HTTPTunnelConnect
 	switch network {
 	case "tcp", "tcp4", "tcp6":
 		// 发送创建tcp连接的信号，服务器会根据这个信号创建对应的连接
@@ -188,6 +205,18 @@ func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) 
 			Operation: "connect",
 			data:      []byte(fmt.Sprintf("%s:%s", network, addr)),
 		}:
+			connect = &HTTPTunnelConnect{
+				StreamID: streamId,
+				Tunnel:   t,
+				ReadChan: make(chan []byte, 100),
+				close:    make(chan struct{}),
+				Addr: &net.TCPAddr{
+					IP:   net.ParseIP(host),
+					Port: portNum,
+				},
+				ReadDeadline:  time.Time{},
+				WriteDeadline: time.Time{},
+			}
 		}
 
 	case "udp", "udp4", "udp6":
@@ -202,23 +231,23 @@ func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) 
 			Operation: "connect",
 			data:      []byte(fmt.Sprintf("%s:%s", network, addr)),
 		}:
+			connect = &HTTPTunnelConnect{
+				StreamID: streamId,
+				Tunnel:   t,
+				ReadChan: make(chan []byte, 100),
+				close:    make(chan struct{}),
+				// Ignore port error because we have already validated the port above
+				Addr: &net.UDPAddr{
+					IP:   net.ParseIP(host),
+					Port: portNum,
+				},
+				ReadDeadline:  time.Time{},
+				WriteDeadline: time.Time{},
+			}
 		}
 
 	default:
 		return nil, fmt.Errorf("unsupported network: %s", network)
-	}
-
-	connect := &HTTPTunnelConnect{
-		StreamID: streamId,
-		Tunnel:   t,
-		ReadChan: make(chan []byte, 100),
-		close:    make(chan struct{}),
-		Addr: fakeAddr{
-			NetworkType: network,
-			RemoteAddr:  addr,
-		},
-		ReadDeadline:  time.Time{},
-		WriteDeadline: time.Time{},
 	}
 
 	t.AddConnect(streamId, connect)
@@ -272,8 +301,7 @@ type HTTPTunnelConnect struct {
 	ReadChan chan []byte
 	close    chan struct{}
 
-	Addr fakeAddr
-
+	Addr          net.Addr
 	ReadDeadline  time.Time
 	WriteDeadline time.Time
 	readBuf       []byte
@@ -413,7 +441,7 @@ func (c *HTTPTunnelConnect) SetWriteDeadline(t time.Time) error {
 }
 
 func (c *HTTPTunnelConnect) LocalAddr() net.Addr {
-	return &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	return &c.Tunnel.LocalAddr
 }
 
 func (c *HTTPTunnelConnect) RemoteAddr() net.Addr {
@@ -432,25 +460,25 @@ func (t *HTTPTunnel) Start(baseURL string) {
 }
 
 func main() {
+
+	Port := flag.Int("port", 1080, "本地SOCKS5代理监听端口，默认1080")
+	Host := flag.String("host", "0.0.0.0", "本地SOCKS5代理监听地址，默认全开放")
+	Target := flag.String("target", "http://127.0.0.1:5000", "隧道服务器地址")
+
+	flag.Parse()
+
+	baseURL := *Target
+
 	tunnel := &HTTPTunnel{
 		connects:  make(map[uint32]*HTTPTunnelConnect),
 		ReadChan:  make(chan DataPackage, 100),
 		WriteChan: make(chan DataPackage, 100),
 		Done:      make(chan struct{}),
-		LocalAddr: fakeAddr{
-			NetworkType: "socks5",
-			RemoteAddr:  "0.0.0.0:1080",
+		LocalAddr: net.TCPAddr{
+			IP:   net.ParseIP(*Host),
+			Port: *Port,
+			Zone: "",
 		},
-	}
-
-	baseURL := os.Getenv("TUNNEL_BASE_URL")
-	if baseURL == "" {
-		baseURL = "http://127.0.0.1:5000"
-	}
-
-	listenAddr := os.Getenv("SOCKS5_LISTEN")
-	if listenAddr == "" {
-		listenAddr = "127.0.0.1:1080"
 	}
 
 	server := socks5.NewServer(
@@ -459,8 +487,8 @@ func main() {
 
 	go tunnel.Start(baseURL)
 
-	log.Printf("SOCKS5 listening on %s, tunnel base url: %s", listenAddr, baseURL)
-	if err := server.ListenAndServe("tcp", listenAddr); err != nil {
+	log.Printf("SOCKS5 listening on %s, tunnel base url: %s", tunnel.LocalAddr.String(), baseURL)
+	if err := server.ListenAndServe("tcp", tunnel.LocalAddr.String()); err != nil {
 		log.Fatalf("SOCKS5 server failed: %v", err)
 	}
 
