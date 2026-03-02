@@ -400,7 +400,7 @@ func (c *HTTPTunnelConnect) SetWriteDeadline(t time.Time) error {
 }
 
 func (c *HTTPTunnelConnect) LocalAddr() net.Addr {
-	return c.Tunnel.LocalAddr
+	return &net.TCPAddr{IP: net.IPv4zero, Port: 0}
 }
 
 func (c *HTTPTunnelConnect) RemoteAddr() net.Addr {
