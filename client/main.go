@@ -44,22 +44,35 @@ type HTTPTunnel struct {
 	LocalAddr fakeAddr
 }
 
+func isDebugEnabled() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("DEBUG")))
+	return v == "1" || v == "true" || v == "yes" || v == "on" || v == "debug"
+}
+
+var debugEnabled = isDebugEnabled()
+
+func dlogf(format string, args ...any) {
+	if debugEnabled {
+		log.Printf(format, args...)
+	}
+}
+
 func (t *HTTPTunnel) StartUpLoad(url string) (net.Conn, error) {
 	log.Printf("[upload] starting upload stream: %s", url)
 	pr, pw := io.Pipe()
 	go func() {
 		defer pw.Close()
-		log.Printf("[upload] writer goroutine started")
+		dlogf("[upload] writer goroutine started")
 		for {
 			select {
 			case d := <-t.WriteChan:
 				line := encodeFrame(d) + "\n"
 				if _, err := pw.Write([]byte(line)); err != nil {
-					log.Printf("[upload] pipe write failed: %v", err)
+					dlogf("[upload] pipe write failed: %v", err)
 					return
 				}
 			case <-t.Done:
-				log.Printf("[upload] writer goroutine stopping by tunnel done")
+				dlogf("[upload] writer goroutine stopping by tunnel done")
 				return
 			}
 		}
@@ -74,18 +87,18 @@ func (t *HTTPTunnel) StartUpLoad(url string) (net.Conn, error) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[upload] request failed: %v", err)
+		dlogf("[upload] request failed: %v", err)
 		return nil, err
 	}
-	log.Printf("[upload] connected, response status=%s", resp.Status)
+	dlogf("[upload] connected, response status=%s", resp.Status)
 	go func() {
 		defer resp.Body.Close()
 		_, copyErr := io.Copy(io.Discard, resp.Body)
 		if copyErr != nil {
-			log.Printf("[upload] response drain error: %v", copyErr)
+			dlogf("[upload] response drain error: %v", copyErr)
 			return
 		}
-		log.Printf("[upload] response body closed by peer")
+		dlogf("[upload] response body closed by peer")
 	}()
 	return nil, nil
 }
@@ -95,11 +108,11 @@ func (t *HTTPTunnel) StartDownload(url string) {
 	log.Printf("[download] starting download stream: %s", url)
 	resp, err := http.Get(url)
 	if err != nil {
-		log.Printf("[download] request failed: %v", err)
+		dlogf("[download] request failed: %v", err)
 		return
 	}
 	defer resp.Body.Close()
-	log.Printf("[download] connected, response status=%s", resp.Status)
+	dlogf("[download] connected, response status=%s", resp.Status)
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
@@ -107,40 +120,40 @@ func (t *HTTPTunnel) StartDownload(url string) {
 	for {
 		select {
 		case <-t.Done:
-			log.Printf("[download] stopping by tunnel done")
+			dlogf("[download] stopping by tunnel done")
 			resp.Body.Close()
 			return
 		default:
 			if !scanner.Scan() {
 				if err := scanner.Err(); err != nil {
-					log.Printf("[download] scanner failed: %v", err)
+					dlogf("[download] scanner failed: %v", err)
 					panic(err)
 				}
-				log.Printf("[download] stream ended by peer (scanner EOF)")
+				dlogf("[download] stream ended by peer (scanner EOF)")
 				return
 			}
 
 			line := strings.TrimSpace(scanner.Text())
-			log.Printf("收到原始数据: %q", line)
+			dlogf("收到原始数据: %q", line)
 			if line == "" {
 				continue
 			}
 
 			streamId, body, err := decodeFrame(line)
 			if err != nil {
-				log.Printf("解析帧失败: %v, 原文: %q", err, line)
+				dlogf("解析帧失败: %v, 原文: %q", err, line)
 				continue
 			}
 
 			func(streamId uint32, data []byte) {
-				log.Printf("准备处理数据包: streamId=%d, data=%d bytes\n", streamId, len(data))
+				dlogf("准备处理数据包: streamId=%d, data=%d bytes\n", streamId, len(data))
 				c, ok := t.GetConnect(streamId)
 				if !ok {
-					log.Printf("未找到 streamId: %d", streamId)
+					dlogf("未找到 streamId: %d", streamId)
 					return
 				}
 				c.ReadChan <- data
-				log.Printf("收到数据包: streamId=%d, data=%d bytes", streamId, len(data))
+				dlogf("收到数据包: streamId=%d, data=%d bytes", streamId, len(data))
 			}(streamId, body)
 		}
 	}
@@ -161,7 +174,7 @@ func (t *HTTPTunnel) AddConnect(streamId uint32, c *HTTPTunnelConnect) {
 
 func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	streamId := uint32(time.Now().UnixNano())
-	log.Printf("[dial] request start: streamId=%d network=%s addr=%s", streamId, network, addr)
+	dlogf("[dial] request start: streamId=%d network=%s addr=%s", streamId, network, addr)
 	switch network {
 	case "tcp", "tcp4", "tcp6":
 		// 发送创建tcp连接的信号，服务器会根据这个信号创建对应的连接
@@ -209,7 +222,7 @@ func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) 
 	}
 
 	t.AddConnect(streamId, connect)
-	log.Printf("[dial] conn created: streamId=%d, network=%s, addr=%s", streamId, network, addr)
+	dlogf("[dial] conn created: streamId=%d, network=%s, addr=%s", streamId, network, addr)
 
 	return connect, nil
 }
@@ -217,7 +230,7 @@ func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) 
 func (t *HTTPTunnel) Close() {
 	// TODO : 关闭对端所有连接
 	t.closeOnce.Do(func() {
-		log.Printf("[tunnel] close invoked")
+		dlogf("[tunnel] close invoked")
 		close(t.Done)
 	})
 }
@@ -290,19 +303,19 @@ func (c *HTTPTunnelConnect) Write(data []byte) (n int, err error) {
 	c.Mu.Lock()
 	deadline := c.WriteDeadline
 	c.Mu.Unlock()
-	log.Printf("准备发送数据包: streamId=%d, data=%d bytes\n", c.StreamID, len(data))
+	dlogf("准备发送数据包: streamId=%d, data=%d bytes\n", c.StreamID, len(data))
 
 	payload := append([]byte(nil), data...)
 
 	select {
 	case <-waitDeadline(deadline):
-		log.Printf("[write] timeout: streamId=%d", c.StreamID)
+		dlogf("[write] timeout: streamId=%d", c.StreamID)
 		return 0, fmt.Errorf("write timeout")
 	case <-c.close:
-		log.Printf("[write] local close detected: streamId=%d", c.StreamID)
+		dlogf("[write] local close detected: streamId=%d", c.StreamID)
 		return 0, io.ErrClosedPipe
 	case <-c.Tunnel.Done:
-		log.Printf("[write] tunnel done detected: streamId=%d", c.StreamID)
+		dlogf("[write] tunnel done detected: streamId=%d", c.StreamID)
 		return 0, io.EOF
 	case c.Tunnel.WriteChan <- DataPackage{
 		streamId:  c.StreamID,
@@ -315,9 +328,9 @@ func (c *HTTPTunnelConnect) Write(data []byte) (n int, err error) {
 
 func (c *HTTPTunnelConnect) Close() error {
 	c.closeOnce.Do(func() {
-		log.Printf("[conn] close invoked: streamId=%d\n", c.StreamID)
+		dlogf("[conn] close invoked: streamId=%d\n", c.StreamID)
 		c.Tunnel.connMu.Lock()
-		// TODO : 关闭服务器端的连接
+		// 关闭服务器端的连接
 		c.Tunnel.WriteChan <- DataPackage{
 			streamId:  c.StreamID,
 			Operation: "close",
@@ -349,17 +362,17 @@ func (c *HTTPTunnelConnect) Read(p []byte) (n int, err error) {
 	}
 	c.Mu.Unlock()
 
-	log.Printf("等待读取数据包: streamId=%d\n", c.StreamID)
+	dlogf("等待读取数据包: streamId=%d\n", c.StreamID)
 	for {
 		select {
 		case <-waitDeadline(deadline):
-			log.Printf("[read] timeout: streamId=%d", c.StreamID)
+			dlogf("[read] timeout: streamId=%d", c.StreamID)
 			return 0, fmt.Errorf("read timeout")
 		case data := <-c.ReadChan:
 			if len(data) == 0 {
 				continue
 			}
-			log.Printf("准备读取数据包: streamId=%d, data=%d bytes\n", c.StreamID, len(data))
+			dlogf("准备读取数据包: streamId=%d, data=%d bytes\n", c.StreamID, len(data))
 			n = copy(p, data)
 			if n < len(data) {
 				c.Mu.Lock()
@@ -368,10 +381,10 @@ func (c *HTTPTunnelConnect) Read(p []byte) (n int, err error) {
 			}
 			return n, nil
 		case <-c.close:
-			log.Printf("[read] local close detected: streamId=%d", c.StreamID)
+			dlogf("[read] local close detected: streamId=%d", c.StreamID)
 			return 0, io.EOF
 		case <-c.Tunnel.Done:
-			log.Printf("[read] tunnel done detected: streamId=%d", c.StreamID)
+			dlogf("[read] tunnel done detected: streamId=%d", c.StreamID)
 			return 0, io.EOF
 		}
 	}
@@ -408,12 +421,12 @@ func (c *HTTPTunnelConnect) RemoteAddr() net.Addr {
 }
 
 func (t *HTTPTunnel) Start(baseURL string) {
-	log.Printf("[tunnel] starting with baseURL=%s", baseURL)
+	dlogf("[tunnel] starting with baseURL=%s", baseURL)
 	go t.StartDownload(baseURL + "/send")
 	go t.StartUpLoad(baseURL + "/receive")
-	log.Printf("[tunnel] upload/download goroutines started")
+	dlogf("[tunnel] upload/download goroutines started")
 	<-t.Done
-	log.Printf("[tunnel] done signal received")
+	dlogf("[tunnel] done signal received")
 	t.Close()
 
 }
