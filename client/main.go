@@ -141,22 +141,34 @@ func (t *HTTPTunnel) StartDownload(url string) {
 				continue
 			}
 
-			streamId, body, err := decodeFrame(line)
+			streamId, op, body, err := decodeFrame(line)
 			if err != nil {
 				dlogf("解析帧失败: %v, 原文: %q", err, line)
 				continue
 			}
 
-			func(streamId uint32, data []byte) {
-				dlogf("准备处理数据包: streamId=%d, data=%d bytes\n", streamId, len(data))
+			if op == "closed" {
+				dlogf("收到关闭信号 streamId=%d", streamId)
 				c, ok := t.GetConnect(streamId)
 				if !ok {
-					dlogf("未找到 streamId: %d", streamId)
-					return
+					dlogf("未找到 streamId: %d,也许已关闭", streamId)
+					continue
 				}
-				c.ReadChan <- data
-				dlogf("收到数据包: streamId=%d, data=%d bytes", streamId, len(data))
-			}(streamId, body)
+				c.Close()
+				dlogf("连接已关闭: streamId=%d", streamId)
+				continue
+			} else {
+				func(streamId uint32, data []byte) {
+					dlogf("准备处理数据包: streamId=%d, data=%d bytes\n", streamId, len(data))
+					c, ok := t.GetConnect(streamId)
+					if !ok {
+						dlogf("未找到 streamId: %d", streamId)
+						return
+					}
+					c.ReadChan <- data
+					dlogf("收到数据包: streamId=%d, data=%d bytes", streamId, len(data))
+				}(streamId, body)
+			}
 		}
 	}
 }
@@ -269,29 +281,29 @@ func encodeFrame(p DataPackage) string {
 	return fmt.Sprintf("%d:%s:%s", p.streamId, p.Operation, b64)
 }
 
-func decodeFrame(line string) (uint32, []byte, error) {
+func decodeFrame(line string) (uint32, string, []byte, error) {
 	parts := strings.SplitN(strings.TrimSpace(line), ":", 3)
 	if len(parts) != 3 {
-		return 0, nil, fmt.Errorf("invalid frame")
+		return 0, "", nil, fmt.Errorf("invalid frame")
 	}
 
 	var streamId uint32
 	if _, err := fmt.Sscanf(parts[0], "%d", &streamId); err != nil {
-		return 0, nil, fmt.Errorf("invalid stream id: %w", err)
+		return 0, "", nil, fmt.Errorf("invalid stream id: %w", err)
 	}
 
 	var op string
 	op = parts[1]
-	if op != "connect" && op != "close" && op != "data" {
-		return 0, nil, fmt.Errorf("invalid operation: %s", op)
+	if op != "connect" && op != "close" && op != "data" && op != "closed" {
+		return 0, "", nil, fmt.Errorf("invalid operation: %s", op)
 	}
 
 	body, err := base64.StdEncoding.DecodeString(parts[2])
 	if err != nil {
-		return 0, nil, fmt.Errorf("invalid base64 payload: %w", err)
+		return 0, "", nil, fmt.Errorf("invalid base64 payload: %w", err)
 	}
 
-	return streamId, body, nil
+	return streamId, op, body, nil
 }
 
 type HTTPTunnelConnect struct {
