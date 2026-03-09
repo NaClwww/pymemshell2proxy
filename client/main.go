@@ -82,6 +82,7 @@ func (t *HTTPTunnel) StartUpLoad(url string) (net.Conn, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("X-Auth-Token", fmt.Sprintf("%d", t.TunnelID))
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -105,7 +106,16 @@ func (t *HTTPTunnel) StartUpLoad(url string) (net.Conn, error) {
 // 下载隧道，从服务器接收数据包
 func (t *HTTPTunnel) StartDownload(url string) error {
 	slog.Debug("[download] starting download stream", "url", url)
-	resp, err := http.Get(url)
+	// 设置隧道ID到请求头，服务器可以根据这个ID识别隧道实例
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		slog.Error("[download] create request failed", "error", err)
+		return err
+	}
+	req.Header.Set("X-Auth-Token", fmt.Sprintf("%d", t.TunnelID))
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		slog.Error("[download] request failed", "error", err)
 		return err
@@ -137,7 +147,7 @@ func (t *HTTPTunnel) StartDownload(url string) error {
 				continue
 			}
 
-			streamId, op, body, err := decodeFrame(line)
+			streamId, op, body, err := decodeFrame(line, t.TunnelID)
 			if err != nil {
 				slog.Error("解析帧失败", "error", err, "line", line)
 				continue
@@ -167,7 +177,6 @@ func (t *HTTPTunnel) StartDownload(url string) error {
 			}
 		}
 	}
-	return nil
 }
 
 func (t *HTTPTunnel) GetConnect(streamId uint32) (*HTTPTunnelConnect, bool) {
@@ -210,6 +219,7 @@ func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) 
 		case <-t.Done:
 			return nil, io.EOF
 		case t.WriteChan <- DataPackage{
+			TunnelID:  t.TunnelID,
 			streamId:  streamId,
 			Operation: "connect",
 			data:      []byte(fmt.Sprintf("%s:%s", network, addr)),
@@ -236,6 +246,7 @@ func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) 
 		case <-t.Done:
 			return nil, io.EOF
 		case t.WriteChan <- DataPackage{
+			TunnelID:  t.TunnelID,
 			streamId:  streamId,
 			Operation: "connect",
 			data:      []byte(fmt.Sprintf("%s:%s", network, addr)),
@@ -275,27 +286,50 @@ func (t *HTTPTunnel) Close() {
 
 func encodeFrame(p DataPackage) string {
 	b64 := base64.StdEncoding.EncodeToString(p.data)
-	return fmt.Sprintf("%d:%s:%s", p.streamId, p.Operation, b64)
+	return fmt.Sprintf("%d:%d:%s:%s", p.TunnelID, p.streamId, p.Operation, b64)
 }
 
-func decodeFrame(line string) (uint32, string, []byte, error) {
-	parts := strings.SplitN(strings.TrimSpace(line), ":", 3)
-	if len(parts) != 3 {
-		return 0, "", nil, fmt.Errorf("invalid frame")
+func decodeFrame(line string, tunnelID uint32) (uint32, string, []byte, error) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return 0, "", nil, fmt.Errorf("invalid frame: empty line")
 	}
 
-	var streamId uint32
-	if _, err := fmt.Sscanf(parts[0], "%d", &streamId); err != nil {
-		return 0, "", nil, fmt.Errorf("invalid stream id: %w", err)
+	tunnelPart, rest, ok := strings.Cut(line, ":")
+	if !ok {
+		return 0, "", nil, fmt.Errorf("invalid frame: missing tunnel id separator")
+	}
+	tunnelVal, err := strconv.ParseUint(tunnelPart, 10, 32)
+	if err != nil {
+		return 0, "", nil, fmt.Errorf("invalid tunnel id %q: %w", tunnelPart, err)
+	}
+	if uint32(tunnelVal) != tunnelID {
+		return 0, "", nil, fmt.Errorf("tunnel id mismatch: expected %d, got %d", tunnelID, tunnelVal)
 	}
 
-	var op string
-	op = parts[1]
-	if op != "connect" && op != "close" && op != "data" && op != "closed" {
+	streamPart, rest, ok := strings.Cut(rest, ":")
+	if !ok {
+		return 0, "", nil, fmt.Errorf("invalid frame: missing stream id separator")
+	}
+
+	op, payloadPart, ok := strings.Cut(rest, ":")
+	if !ok {
+		return 0, "", nil, fmt.Errorf("invalid frame: missing operation separator")
+	}
+
+	streamVal, err := strconv.ParseUint(streamPart, 10, 32)
+	if err != nil {
+		return 0, "", nil, fmt.Errorf("invalid stream id %q: %w", streamPart, err)
+	}
+	streamId := uint32(streamVal)
+
+	switch op {
+	case "connect", "close", "data", "closed":
+	default:
 		return 0, "", nil, fmt.Errorf("invalid operation: %s", op)
 	}
 
-	body, err := base64.StdEncoding.DecodeString(parts[2])
+	body, err := base64.StdEncoding.DecodeString(payloadPart)
 	if err != nil {
 		return 0, "", nil, fmt.Errorf("invalid base64 payload: %w", err)
 	}
