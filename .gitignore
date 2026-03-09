@@ -1,1 +1,8 @@
 client/client
+*/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dll
+*/.venv/

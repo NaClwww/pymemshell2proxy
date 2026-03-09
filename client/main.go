@@ -7,7 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -20,6 +21,7 @@ import (
 )
 
 type DataPackage struct {
+	TunnelID  uint32
 	streamId  uint32
 	Operation string
 	data      []byte
@@ -34,6 +36,7 @@ func (f fakeAddr) Network() string { return f.NetworkType }
 func (f fakeAddr) String() string  { return f.RemoteAddr }
 
 type HTTPTunnel struct {
+	TunnelID uint32 // 隧道ID，可以用来区分不同的隧道实例，用于多个客户端连接同一个服务器的场景
 	connects map[uint32]*HTTPTunnelConnect
 	connMu   sync.RWMutex
 
@@ -53,28 +56,22 @@ func isDebugEnabled() bool {
 
 var debugEnabled = isDebugEnabled()
 
-func dlogf(format string, args ...any) {
-	if debugEnabled {
-		log.Printf(format, args...)
-	}
-}
-
 func (t *HTTPTunnel) StartUpLoad(url string) (net.Conn, error) {
-	log.Printf("[upload] starting upload stream: %s", url)
+	slog.Debug("[upload] starting upload stream", "url", url)
 	pr, pw := io.Pipe()
 	go func() {
 		defer pw.Close()
-		dlogf("[upload] writer goroutine started")
+		slog.Debug("[upload] writer goroutine started")
 		for {
 			select {
 			case d := <-t.WriteChan:
 				line := encodeFrame(d) + "\n"
 				if _, err := pw.Write([]byte(line)); err != nil {
-					dlogf("[upload] pipe write failed: %v", err)
+					slog.Error("[upload] writer goroutine ", "error", err)
 					return
 				}
 			case <-t.Done:
-				dlogf("[upload] writer goroutine stopping by tunnel done")
+				slog.Debug("[upload] writer goroutine stopping by tunnel done")
 				return
 			}
 		}
@@ -89,32 +86,32 @@ func (t *HTTPTunnel) StartUpLoad(url string) (net.Conn, error) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		dlogf("[upload] request failed: %v", err)
+		slog.Error("[upload] request failed:", "error", err)
 		return nil, err
 	}
-	dlogf("[upload] connected, response status=%s", resp.Status)
-	go func() {
+	slog.Info("[upload] connected, response ", "status", resp.Status)
+	func() {
 		defer resp.Body.Close()
 		_, copyErr := io.Copy(io.Discard, resp.Body)
 		if copyErr != nil {
-			dlogf("[upload] response drain error: %v", copyErr)
+			slog.Error("[upload] response drain", "error", copyErr)
 			return
 		}
-		dlogf("[upload] response body closed by peer")
+		slog.Debug("[upload] response body closed by peer")
 	}()
 	return nil, nil
 }
 
 // 下载隧道，从服务器接收数据包
-func (t *HTTPTunnel) StartDownload(url string) {
-	log.Printf("[download] starting download stream: %s", url)
+func (t *HTTPTunnel) StartDownload(url string) error {
+	slog.Debug("[download] starting download stream", "url", url)
 	resp, err := http.Get(url)
 	if err != nil {
-		dlogf("[download] request failed: %v", err)
-		return
+		slog.Error("[download] request failed", "error", err)
+		return err
 	}
 	defer resp.Body.Close()
-	dlogf("[download] connected, response status=%s", resp.Status)
+	slog.Debug("[download] connected, response ", "status", resp.Status)
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
@@ -122,55 +119,55 @@ func (t *HTTPTunnel) StartDownload(url string) {
 	for {
 		select {
 		case <-t.Done:
-			dlogf("[download] stopping by tunnel done")
+			slog.Debug("[download] stopping by tunnel done")
 			resp.Body.Close()
-			return
+			return nil
 		default:
 			if !scanner.Scan() {
 				if err := scanner.Err(); err != nil {
-					dlogf("[download] scanner failed: %v", err)
-					panic(err)
+					return err
 				}
-				dlogf("[download] stream ended by peer (scanner EOF)")
-				return
+				slog.Debug("[download] stream ended by peer (scanner EOF)")
+				return nil
 			}
 
 			line := strings.TrimSpace(scanner.Text())
-			dlogf("收到原始数据: %q", line)
+			slog.Debug("收到原始数据", "line", line)
 			if line == "" {
 				continue
 			}
 
 			streamId, op, body, err := decodeFrame(line)
 			if err != nil {
-				dlogf("解析帧失败: %v, 原文: %q", err, line)
+				slog.Error("解析帧失败", "error", err, "line", line)
 				continue
 			}
 
 			if op == "closed" {
-				dlogf("收到关闭信号 streamId=%d", streamId)
+				slog.Debug("收到关闭信号", "streamId", streamId)
 				c, ok := t.GetConnect(streamId)
 				if !ok {
-					dlogf("未找到 streamId: %d,也许已关闭", streamId)
+					slog.Debug("未找到 streamId", "streamId", streamId)
 					continue
 				}
 				c.Close()
-				dlogf("连接已关闭: streamId=%d", streamId)
+				slog.Debug("连接已关闭", "streamId", streamId)
 				continue
 			} else {
 				func(streamId uint32, data []byte) {
-					dlogf("准备处理数据包: streamId=%d, data=%d bytes\n", streamId, len(data))
+					slog.Debug("准备处理数据包", "streamId", streamId, "data", len(data))
 					c, ok := t.GetConnect(streamId)
 					if !ok {
-						dlogf("未找到 streamId: %d", streamId)
+						slog.Debug("未找到 streamId", "streamId", streamId)
 						return
 					}
 					c.ReadChan <- data
-					dlogf("收到数据包: streamId=%d, data=%d bytes", streamId, len(data))
+					slog.Debug("收到数据包", "streamId", streamId, "data", len(data))
 				}(streamId, body)
 			}
 		}
 	}
+	return nil
 }
 
 func (t *HTTPTunnel) GetConnect(streamId uint32) (*HTTPTunnelConnect, bool) {
@@ -194,7 +191,7 @@ func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) 
 			break
 		}
 	}
-	dlogf("[dial] request start: streamId=%d network=%s addr=%s", streamId, network, addr)
+	slog.Debug("[dial] request start", "streamId", streamId, "network", network, "addr", addr)
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid address: %w", err)
@@ -263,7 +260,7 @@ func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) 
 	}
 
 	t.AddConnect(streamId, connect)
-	dlogf("[dial] conn created: streamId=%d, network=%s, addr=%s", streamId, network, addr)
+	slog.Debug("[dial] conn created", "streamId", streamId, "network", network, "addr", addr)
 
 	return connect, nil
 }
@@ -271,7 +268,7 @@ func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) 
 func (t *HTTPTunnel) Close() {
 	// TODO : 关闭对端所有连接
 	t.closeOnce.Do(func() {
-		dlogf("[tunnel] close invoked")
+		slog.Debug("[tunnel] close invoked")
 		close(t.Done)
 	})
 }
@@ -343,21 +340,22 @@ func (c *HTTPTunnelConnect) Write(data []byte) (n int, err error) {
 	c.Mu.Lock()
 	deadline := c.WriteDeadline
 	c.Mu.Unlock()
-	dlogf("准备发送数据包: streamId=%d, data=%d bytes\n", c.StreamID, len(data))
+	slog.Debug("准备发送数据包", "streamId", c.StreamID, "data", len(data))
 
 	payload := append([]byte(nil), data...)
 
 	select {
 	case <-waitDeadline(deadline):
-		dlogf("[write] timeout: streamId=%d", c.StreamID)
+		slog.Error("[write] timeout", "streamId", c.StreamID)
 		return 0, fmt.Errorf("write timeout")
 	case <-c.close:
-		dlogf("[write] local close detected: streamId=%d", c.StreamID)
+		slog.Error("[write] local close detected", "streamId", c.StreamID)
 		return 0, io.ErrClosedPipe
 	case <-c.Tunnel.Done:
-		dlogf("[write] tunnel done detected: streamId=%d", c.StreamID)
+		slog.Error("[write] tunnel done detected", "streamId", c.StreamID)
 		return 0, io.EOF
 	case c.Tunnel.WriteChan <- DataPackage{
+		TunnelID:  c.Tunnel.TunnelID,
 		streamId:  c.StreamID,
 		Operation: "data",
 		data:      payload,
@@ -368,7 +366,7 @@ func (c *HTTPTunnelConnect) Write(data []byte) (n int, err error) {
 
 func (c *HTTPTunnelConnect) Close() error {
 	c.closeOnce.Do(func() {
-		dlogf("[conn] close invoked: streamId=%d\n", c.StreamID)
+		slog.Debug("[conn] close invoked", "streamId", c.StreamID)
 		c.Tunnel.connMu.Lock()
 		// 关闭服务器端的连接
 		c.Tunnel.WriteChan <- DataPackage{
@@ -402,17 +400,17 @@ func (c *HTTPTunnelConnect) Read(p []byte) (n int, err error) {
 	}
 	c.Mu.Unlock()
 
-	dlogf("等待读取数据包: streamId=%d\n", c.StreamID)
+	slog.Debug("等待读取数据包", "streamId", c.StreamID)
 	for {
 		select {
 		case <-waitDeadline(deadline):
-			dlogf("[read] timeout: streamId=%d", c.StreamID)
+			slog.Error("[read] timeout", "streamId", c.StreamID)
 			return 0, fmt.Errorf("read timeout")
 		case data := <-c.ReadChan:
 			if len(data) == 0 {
 				continue
 			}
-			dlogf("准备读取数据包: streamId=%d, data=%d bytes\n", c.StreamID, len(data))
+			slog.Debug("准备读取数据包", "streamId", c.StreamID, "data", len(data))
 			n = copy(p, data)
 			if n < len(data) {
 				c.Mu.Lock()
@@ -421,10 +419,10 @@ func (c *HTTPTunnelConnect) Read(p []byte) (n int, err error) {
 			}
 			return n, nil
 		case <-c.close:
-			dlogf("[read] local close detected: streamId=%d", c.StreamID)
+			slog.Error("[read] local close detected", "streamId", c.StreamID)
 			return 0, io.EOF
 		case <-c.Tunnel.Done:
-			dlogf("[read] tunnel done detected: streamId=%d", c.StreamID)
+			slog.Error("[read] tunnel done detected", "streamId", c.StreamID)
 			return 0, io.EOF
 		}
 	}
@@ -461,17 +459,53 @@ func (c *HTTPTunnelConnect) RemoteAddr() net.Addr {
 }
 
 func (t *HTTPTunnel) Start(baseURL string) {
-	dlogf("[tunnel] starting with baseURL=%s", baseURL)
-	go t.StartDownload(baseURL + "/send")
-	go t.StartUpLoad(baseURL + "/receive")
-	dlogf("[tunnel] upload/download goroutines started")
+	slog.Info("[tunnel] starting with baseURL", "baseURL", baseURL)
+
+	go func() {
+		for {
+			select {
+			case <-t.Done:
+				slog.Info("[tunnel] download goroutine stopping by tunnel done")
+				return
+			default:
+				if err := t.StartDownload(baseURL + "/send"); err != nil {
+					slog.Error("[tunnel] download stream failed", "error", err)
+					time.Sleep(3 * time.Second)
+					continue
+				}
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-t.Done:
+				slog.Info("[tunnel] upload goroutine stopping by tunnel done")
+				return
+			default:
+				if _, err := t.StartUpLoad(baseURL + "/receive"); err != nil {
+					slog.Error("[tunnel] upload stream failed", "error", err)
+					time.Sleep(3 * time.Second)
+					continue
+				}
+			}
+		}
+	}()
+	slog.Info("[tunnel] upload/download goroutines started")
 	<-t.Done
-	dlogf("[tunnel] done signal received")
+	slog.Info("[tunnel] done signal received")
 	t.Close()
 
 }
 
 func main() {
+
+	opts := &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}
+	handler := slog.NewTextHandler(os.Stdout, opts)
+	slog.SetDefault(slog.New(handler))
 
 	Port := flag.Int("port", 1080, "本地SOCKS5代理监听端口，默认1080")
 	Host := flag.String("host", "0.0.0.0", "本地SOCKS5代理监听地址，默认全开放")
@@ -482,6 +516,7 @@ func main() {
 	baseURL := *Target
 
 	tunnel := &HTTPTunnel{
+		TunnelID:  rand.Uint32(),
 		connects:  make(map[uint32]*HTTPTunnelConnect),
 		ReadChan:  make(chan DataPackage, 100),
 		WriteChan: make(chan DataPackage, 100),
@@ -499,9 +534,9 @@ func main() {
 
 	go tunnel.Start(baseURL)
 
-	log.Printf("SOCKS5 listening on %s, tunnel base url: %s", tunnel.LocalAddr.String(), baseURL)
+	slog.Info("SOCKS5 listening on ", "host", *Host, "port", *Port)
 	if err := server.ListenAndServe("tcp", tunnel.LocalAddr.String()); err != nil {
-		log.Fatalf("SOCKS5 server failed: %v", err)
+		slog.Error("SOCKS5 server failed: ", "error", err)
 	}
 
 }
