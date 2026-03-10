@@ -21,7 +21,6 @@ import (
 )
 
 type DataPackage struct {
-	TunnelID  uint32
 	streamId  uint32
 	Operation string
 	data      []byte
@@ -147,7 +146,7 @@ func (t *HTTPTunnel) StartDownload(url string) error {
 				continue
 			}
 
-			streamId, op, body, err := decodeFrame(line, t.TunnelID)
+			streamId, op, body, err := decodeFrame(line)
 			if err != nil {
 				slog.Error("解析帧失败", "error", err, "line", line)
 				continue
@@ -219,7 +218,6 @@ func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) 
 		case <-t.Done:
 			return nil, io.EOF
 		case t.WriteChan <- DataPackage{
-			TunnelID:  t.TunnelID,
 			streamId:  streamId,
 			Operation: "connect",
 			data:      []byte(fmt.Sprintf("%s:%s", network, addr)),
@@ -246,7 +244,6 @@ func (t *HTTPTunnel) HTTPConnectDial(ctx context.Context, network, addr string) 
 		case <-t.Done:
 			return nil, io.EOF
 		case t.WriteChan <- DataPackage{
-			TunnelID:  t.TunnelID,
 			streamId:  streamId,
 			Operation: "connect",
 			data:      []byte(fmt.Sprintf("%s:%s", network, addr)),
@@ -286,28 +283,16 @@ func (t *HTTPTunnel) Close() {
 
 func encodeFrame(p DataPackage) string {
 	b64 := base64.StdEncoding.EncodeToString(p.data)
-	return fmt.Sprintf("%d:%d:%s:%s", p.TunnelID, p.streamId, p.Operation, b64)
+	return fmt.Sprintf("%d:%s:%s", p.streamId, p.Operation, b64)
 }
 
-func decodeFrame(line string, tunnelID uint32) (uint32, string, []byte, error) {
+func decodeFrame(line string) (uint32, string, []byte, error) {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return 0, "", nil, fmt.Errorf("invalid frame: empty line")
 	}
 
-	tunnelPart, rest, ok := strings.Cut(line, ":")
-	if !ok {
-		return 0, "", nil, fmt.Errorf("invalid frame: missing tunnel id separator")
-	}
-	tunnelVal, err := strconv.ParseUint(tunnelPart, 10, 32)
-	if err != nil {
-		return 0, "", nil, fmt.Errorf("invalid tunnel id %q: %w", tunnelPart, err)
-	}
-	if uint32(tunnelVal) != tunnelID {
-		return 0, "", nil, fmt.Errorf("tunnel id mismatch: expected %d, got %d", tunnelID, tunnelVal)
-	}
-
-	streamPart, rest, ok := strings.Cut(rest, ":")
+	streamPart, rest, ok := strings.Cut(line, ":")
 	if !ok {
 		return 0, "", nil, fmt.Errorf("invalid frame: missing stream id separator")
 	}
@@ -389,7 +374,6 @@ func (c *HTTPTunnelConnect) Write(data []byte) (n int, err error) {
 		slog.Error("[write] tunnel done detected", "streamId", c.StreamID)
 		return 0, io.EOF
 	case c.Tunnel.WriteChan <- DataPackage{
-		TunnelID:  c.Tunnel.TunnelID,
 		streamId:  c.StreamID,
 		Operation: "data",
 		data:      payload,
